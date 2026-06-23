@@ -1,0 +1,20 @@
+# 研究業績テキストファイル サンプル
+# カテゴリは [ ] や【 】で囲むか、そのままキーワードを書いてください。
+# 行頭の # はコメントです。
+
+[論文]
+Akira Nakai, Maki Tanaka: Development and validation of a scale for assessing enjoyment of rogaining activities, Journal of Physical Education and Sport, 26(5): 927-934, 2026年5月, DOI:10.7752/jpes.2026.05093
+中井聖，田中真紀: ラダーゲッターの投げ方の支援方法の提案: ラダーの設置距離の違いに着目して, 自由時間研究, 50, 8-15, 2025年3月
+
+[著書・編著]
+中井聖, 田中真紀: スポーツ活動の楽しさ研究, 大修館書店, 2024年4月, ISBN:978-4-469-26100-0
+
+[講演・口頭発表]
+中井聖, 田中真紀: ロゲイニングの楽しさに関する尺度開発, 日本体育学会第75回大会, 2025年9月, 大阪
+Akira Nakai: Enjoyment in outdoor sports activities, International Sport Science Congress, 2025年8月, Tokyo
+
+[研究プロジェクト]
+科研費基盤研究(C): ロゲイニング活動における参加者の楽しさを高める指導方法の研究, 2022-2025, 代表者: 中井聖, 課題番号: 22K01234
+
+[報告書・その他]
+中井聖: 自由時間活動における楽しさの構造, 大阪電気通信大学研究紀要, 2025年3月
