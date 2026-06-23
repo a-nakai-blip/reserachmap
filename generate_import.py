@@ -1,17 +1,10 @@
 #!/usr/bin/env python3
 """
-大学研究業績テキスト → researchmap インポート JSON 生成スクリプト
+業績.md + researchmap エクスポート JSONL → インポート用 JSONL 生成
 
 使い方:
-  python generate_import.py --input 業績.txt --export researchmap_export.json --output import.json
-
-  --export を省略すると重複チェックなしで全件をインポートファイルに出力する。
-  --dry-run を付けると件数確認のみ行い、ファイルを出力しない。
-  --category で特定カテゴリのみ処理 (paper / book / presentation / project / other)
-
-researchmap のエクスポート/インポート:
-  エクスポート: researchmap にログイン → 業績管理 → 各カテゴリ → 「エクスポート」→ JSON
-  インポート:   researchmap にログイン → 業績管理 → 各カテゴリ → 「インポート」→ JSON を選択
+  python generate_import.py --gyoseki 業績.md --jsonl rm_researchers20260623.jsonl
+  python generate_import.py --gyoseki 業績.md --jsonl rm_researchers20260623.jsonl --output import.jsonl --verbose
 """
 
 import argparse
@@ -23,251 +16,213 @@ import parser as p
 import converter as c
 
 
-CATEGORIES = ["paper", "book", "presentation", "project", "other"]
+# ── JSONL から既存データのインデックスを構築 ─────────────────────
 
-# ---- エクスポート JSON から既存データをインデックス化するキー抽出関数 ----
+class DedupIndex:
+    def __init__(self, jsonl_path: str):
+        self.papers_doi: set[str] = set()
+        self.papers_title: set[str] = set()
+        self.books_title: set[str] = set()
+        self.pres_key: set[tuple] = set()   # (title_lower, year_str)
+        self.misc_title: set[str] = set()   # misc + books_etc のタイトル両方
+        self.proj_grant: set[str] = set()
+        self.proj_title: set[str] = set()
+        self.user_id: str = ''
 
-def _text_val(field) -> str:
-    """[{"@value": "...", "@language": "..."}] 形式から値を取り出す。"""
-    if isinstance(field, list) and field:
-        return field[0].get("@value", "").strip().lower()
-    if isinstance(field, str):
-        return field.strip().lower()
-    return ""
+        with open(jsonl_path, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                ins = data.get('insert', {})
+                m = data.get('merge', {})
+                t = ins.get('type', '')
 
+                if t == 'researchers' and not self.user_id:
+                    self.user_id = ins.get('id', '')
 
-REMOTE_KEY_FUNCS: dict[str, dict[str, callable]] = {
-    "paper": {
-        "doi": lambda item: (item.get("doi") or "").strip().lower(),
-        "title": lambda item: _text_val(item.get("paper_title")),
-    },
-    "book": {
-        "isbn": lambda item: re.sub(r'[-\s]', '', item.get("isbn") or "").lower(),
-        "title": lambda item: _text_val(item.get("book_title")),
-    },
-    "presentation": {
-        "title": lambda item: _text_val(item.get("presentation_title")),
-    },
-    "project": {
-        "title": lambda item: _text_val(item.get("research_project_title")),
-    },
-    "other": {
-        "title": lambda item: _text_val(item.get("misc_title")),
-    },
-}
+                elif t == 'published_papers':
+                    for doi in m.get('identifiers', {}).get('doi', []):
+                        self.papers_doi.add(doi.lower())
+                    for v in m.get('paper_title', {}).values():
+                        self.papers_title.add(_norm(v))
 
-LOCAL_KEY_FUNCS: dict[str, dict[str, callable]] = {
-    "paper": {
-        "doi": lambda obj: (obj.doi or "").strip().lower(),
-        "title": lambda obj: obj.title.strip().lower(),
-    },
-    "book": {
-        "isbn": lambda obj: re.sub(r'[-\s]', '', obj.isbn or "").lower(),
-        "title": lambda obj: obj.title.strip().lower(),
-    },
-    "presentation": {
-        "title": lambda obj: obj.title.strip().lower(),
-    },
-    "project": {
-        "title": lambda obj: obj.title.strip().lower(),
-    },
-    "other": {
-        "title": lambda obj: obj.title.strip().lower(),
-    },
-}
+                elif t == 'books_etc':
+                    for v in m.get('book_title', {}).values():
+                        k = _norm(v)
+                        self.books_title.add(k)
+                        self.misc_title.add(k)   # misc との重複も防ぐ
 
-PRIMARY_KEYS = {
-    "paper": "doi",
-    "book": "isbn",
-    "presentation": "title",
-    "project": "title",
-    "other": "title",
-}
+                elif t == 'presentations':
+                    year = str(m.get('publication_date', ''))[:4]
+                    for v in m.get('presentation_title', {}).values():
+                        self.pres_key.add((_norm(v), year))
 
+                elif t == 'misc':
+                    for v in m.get('paper_title', {}).values():
+                        self.misc_title.add(_norm(v))
 
-def build_remote_index(export_data: dict, category: str) -> dict[str, set]:
-    """
-    エクスポートデータからカテゴリごとの既存キーセットを返す。
-    {key_type: {value, ...}} の形式。
-    """
-    export_key = c.EXPORT_KEYS[category]
-    items = export_data.get(export_key, [])
-    index: dict[str, set] = {k: set() for k in REMOTE_KEY_FUNCS[category]}
-    for item in items:
-        for key_type, extractor in REMOTE_KEY_FUNCS[category].items():
-            val = extractor(item)
-            if val:
-                index[key_type].add(val)
-    return index
+                elif t == 'research_projects':
+                    for gn in m.get('identifiers', {}).get('grant_number', []):
+                        self.proj_grant.add(gn)
+                    for v in m.get('research_project_title', {}).values():
+                        self.proj_title.add(_norm(v))
 
+    # ── 重複判定メソッド ──────────────────────────────────────
 
-def is_duplicate(obj, category: str, remote_index: dict[str, set]) -> bool:
-    """ローカルオブジェクトが既存データに含まれるか判定する。"""
-    prim = PRIMARY_KEYS[category]
-    local_funcs = LOCAL_KEY_FUNCS[category]
-
-    # プライマリキー（DOI / ISBN）が両方に存在する場合はそれで判定
-    primary_func = local_funcs.get(prim)
-    if primary_func:
-        local_val = primary_func(obj)
-        if local_val and local_val in remote_index.get(prim, set()):
+    def is_paper_dup(self, paper) -> bool:
+        if paper.doi and paper.doi.lower() in self.papers_doi:
             return True
-        # プライマリキーが取れたがリモートに無い → 重複なし（タイトル照合しない）
-        if local_val:
-            return False
+        return _norm(paper.title) in self.papers_title
 
-    # プライマリキーが無い場合はタイトルで照合
-    title_func = local_funcs.get("title")
-    if title_func:
-        local_title = title_func(obj)
-        if local_title and local_title in remote_index.get("title", set()):
-            return True
+    def is_book_dup(self, book) -> bool:
+        return _norm(book.title) in self.books_title
 
-    return False
+    def is_pres_dup(self, pres) -> bool:
+        year = str(pres.year) if pres.year else ''
+        return (_norm(pres.title), year) in self.pres_key
 
+    def is_misc_dup(self, item) -> bool:
+        return _norm(item.title) in self.misc_title
 
-def get_local_items(parsed: p.ParsedData, category: str) -> list:
-    return {
-        "paper": parsed.papers,
-        "book": parsed.books,
-        "presentation": parsed.presentations,
-        "project": parsed.projects,
-        "other": parsed.others,
-    }[category]
+    def is_proj_dup(self, proj) -> bool:
+        if proj.grant_number:
+            return proj.grant_number in self.proj_grant
+        return _norm(proj.title) in self.proj_title
 
 
-def process_category(
-    parsed: p.ParsedData,
-    category: str,
-    export_data: dict,
-    verbose: bool,
-) -> tuple[list[dict], int, int]:
-    """
-    カテゴリを処理し、(新規ペイロードリスト, 新規件数, 重複件数) を返す。
-    """
-    local_items = get_local_items(parsed, category)
-    if not local_items:
-        return [], 0, 0
+def _norm(text: str) -> str:
+    return text.lower().strip()
 
-    remote_index = build_remote_index(export_data, category)
-    payload_func = c.PAYLOAD_FUNCS[category]
 
-    new_items = []
-    dup_count = 0
-    for obj in local_items:
-        if is_duplicate(obj, category, remote_index):
-            dup_count += 1
+# ── カテゴリ処理 ─────────────────────────────────────────────
+
+def _process(parsed: p.ParsedData, idx: DedupIndex, verbose: bool) -> list[tuple[str, dict]]:
+    """(type, merge_dict) のリストを返す"""
+    results = []
+
+    def _add(type_name, obj, merge_fn, is_dup_fn, label_fn):
+        dup = is_dup_fn(obj)
+        label = label_fn(obj)
+        if dup:
             if verbose:
-                print(f"  [SKIP] {obj.title[:60]}")
+                print(f'  [SKIP] {label[:70]}')
         else:
-            new_items.append(payload_func(obj))
             if verbose:
-                print(f"  [NEW]  {obj.title[:60]}")
+                print(f'  [NEW]  {label[:70]}')
+            results.append((type_name, merge_fn(obj)))
 
-    return new_items, len(new_items), dup_count
+    # 論文
+    if verbose:
+        print(f'\n=== 学術論文 ({len(parsed.papers)} 件) ===')
+    for obj in parsed.papers:
+        _add('published_papers', obj, c.paper_to_merge, idx.is_paper_dup,
+             lambda o: o.title)
+
+    # 著書等
+    if verbose:
+        print(f'\n=== 著書等 ({len(parsed.books)} 件) ===')
+    for obj in parsed.books:
+        _add('books_etc', obj, c.book_to_merge, idx.is_book_dup,
+             lambda o: o.title)
+
+    # 発表
+    if verbose:
+        print(f'\n=== 発表 ({len(parsed.presentations)} 件) ===')
+    for obj in parsed.presentations:
+        _add('presentations', obj, c.presentation_to_merge, idx.is_pres_dup,
+             lambda o: o.title)
+
+    # 報告書・その他
+    if verbose:
+        print(f'\n=== 報告書・その他 ({len(parsed.misc)} 件) ===')
+    for obj in parsed.misc:
+        _add('misc', obj, c.misc_to_merge, idx.is_misc_dup,
+             lambda o: o.title)
+
+    # 外部資金
+    if verbose:
+        print(f'\n=== 外部資金 ({len(parsed.projects)} 件) ===')
+    for obj in parsed.projects:
+        _add('research_projects', obj, c.project_to_merge, idx.is_proj_dup,
+             lambda o: o.title)
+
+    return results
 
 
-import re  # noqa: E402
-
+# ── メイン ──────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(
-        description="大学業績テキスト → researchmap インポート JSON 生成"
+        description='業績.md + researchmap JSONL → インポート用 JSONL 生成'
     )
-    ap.add_argument("--input", "-i", required=True, help="業績テキストファイル")
-    ap.add_argument(
-        "--export", "-e",
-        help="researchmap からエクスポートした JSON ファイル（省略時は全件出力）",
-    )
-    ap.add_argument(
-        "--output", "-o", default="import.json",
-        help="出力ファイル名 (デフォルト: import.json)",
-    )
-    ap.add_argument("--dry-run", "-n", action="store_true", help="件数確認のみ、ファイル出力しない")
-    ap.add_argument("--category", choices=CATEGORIES, help="処理するカテゴリを指定")
-    ap.add_argument("--verbose", "-v", action="store_true", help="各件の処理状況を表示")
+    ap.add_argument('--gyoseki', '-g', required=True,
+                    help='業績テキストファイル（.md など）')
+    ap.add_argument('--jsonl', '-j', required=True,
+                    help='researchmap エクスポート JSONL ファイル')
+    ap.add_argument('--output', '-o', default='import.jsonl',
+                    help='出力ファイル名（デフォルト: import.jsonl）')
+    ap.add_argument('--dry-run', '-n', action='store_true',
+                    help='件数確認のみ。ファイルは出力しない')
+    ap.add_argument('--verbose', '-v', action='store_true',
+                    help='各件の処理状況を表示')
     args = ap.parse_args()
 
-    # 業績テキスト読み込み
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"[ERROR] 入力ファイルが見つかりません: {input_path}", file=sys.stderr)
-        sys.exit(1)
-
-    text = input_path.read_text(encoding="utf-8")
-    parsed = p.parse_text(text)
-    print(f"パース結果: 論文={len(parsed.papers)}, 著書={len(parsed.books)}, "
-          f"講演={len(parsed.presentations)}, プロジェクト={len(parsed.projects)}, "
-          f"その他={len(parsed.others)}")
-
-    # researchmap エクスポート JSON 読み込み
-    export_data: dict = {}
-    if args.export:
-        export_path = Path(args.export)
-        if not export_path.exists():
-            print(f"[ERROR] エクスポートファイルが見つかりません: {export_path}", file=sys.stderr)
+    # 入力ファイル確認
+    for path, name in [(args.gyoseki, '業績ファイル'), (args.jsonl, 'JSONL ファイル')]:
+        if not Path(path).exists():
+            print(f'[ERROR] {name}が見つかりません: {path}', file=sys.stderr)
             sys.exit(1)
-        raw = json.loads(export_path.read_text(encoding="utf-8"))
-        # エクスポートファイルがリストの場合（カテゴリ単体エクスポート）も対応
-        if isinstance(raw, list):
-            # カテゴリ名をファイル名から推定
-            stem = export_path.stem.lower()
-            for cat, key in c.EXPORT_KEYS.items():
-                if cat in stem or key in stem:
-                    export_data = {key: raw}
-                    break
-            else:
-                # 推定できない場合は --category が必須
-                if not args.category:
-                    print("[ERROR] エクスポートがリスト形式の場合は --category を指定してください。",
-                          file=sys.stderr)
-                    sys.exit(1)
-                export_data = {c.EXPORT_KEYS[args.category]: raw}
-        else:
-            export_data = raw
-        print(f"エクスポート読み込み: {export_path.name}")
-    else:
-        print("エクスポートファイル未指定: 重複チェックなしで全件を出力します。")
 
-    # カテゴリ処理
-    target_categories = [args.category] if args.category else CATEGORIES
-    result: dict[str, list] = {}
-    total_new = total_dup = 0
+    # 業績テキストをパース
+    text = Path(args.gyoseki).read_text(encoding='utf-8')
+    parsed = p.parse_text(text)
+    print(
+        f'業績パース結果: 論文={len(parsed.papers)}, 著書={len(parsed.books)}, '
+        f'発表={len(parsed.presentations)}, 報告書等={len(parsed.misc)}, '
+        f'外部資金={len(parsed.projects)}'
+    )
 
-    for cat in target_categories:
-        if args.verbose:
-            print(f"\n=== {cat} ===")
-        new_items, new_count, dup_count = process_category(
-            parsed, cat, export_data, args.verbose
-        )
-        total_new += new_count
-        total_dup += dup_count
-        if new_items:
-            result[c.EXPORT_KEYS[cat]] = new_items
+    # JSONL から既存データを読み込み
+    idx = DedupIndex(args.jsonl)
+    print(f'既存データ読み込み完了 (user_id: {idx.user_id})')
 
-    # サマリ
-    print(f"\n新規: {total_new} 件, スキップ(重複): {total_dup} 件")
+    # 重複チェック・変換
+    new_items = _process(parsed, idx, args.verbose)
+
+    total_new = len(new_items)
+    total_dup = (len(parsed.papers) + len(parsed.books) +
+                 len(parsed.presentations) + len(parsed.misc) +
+                 len(parsed.projects)) - total_new
+
+    print(f'\n新規: {total_new} 件 / スキップ（重複）: {total_dup} 件')
 
     if args.dry_run:
-        print("（ドライラン: ファイルを出力しません）")
+        print('（ドライラン: ファイルを出力しません）')
         return
 
-    if not result:
-        print("出力する新規データがありません。")
+    if not new_items:
+        print('新規データがないため、ファイルを出力しません。')
         return
 
-    output_path = Path(args.output)
-    output_path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    print(f"インポートファイルを出力しました: {output_path}")
+    # JSONL 出力
+    out_path = Path(args.output)
+    with out_path.open('w', encoding='utf-8') as f:
+        for type_name, merge in new_items:
+            record = {
+                'insert': {'type': type_name, 'user_id': idx.user_id},
+                'merge': merge,
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+    print(f'\nインポートファイルを出力しました: {out_path}  ({total_new} 件)')
     print()
-    print("次のステップ:")
-    print("  1. researchmap にログイン")
-    print("  2. 業績管理 → 各カテゴリ → 「インポート」")
-    print(f"  3. {output_path} を選択してインポート")
+    print('次のステップ:')
+    print('  1. researchmap にログイン')
+    print('  2. 右上メニュー → 「業績のエクスポート/インポート」')
+    print(f'  3. {out_path} を選択してインポート実行')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

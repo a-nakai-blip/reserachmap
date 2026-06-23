@@ -1,368 +1,449 @@
 """
-大学研究業績サイトのテキストデータをパースするモジュール。
+業績.md パーサー
 
-対応フォーマット例:
-  [論文]
-  Akira Nakai, Maki Tanaka: Development and validation ..., Journal Name, 26(5): 927-934, 2026年5月, DOI:10.7752/jpes.2026.05093
-  中井聖，田中真紀: タイトル, 雑誌名, 50, 8-15, 2025年3月
-
-  [著書]
-  中井聖: 書名, 出版社, 2024年4月
-
-  [講演]
-  中井聖: 発表タイトル, 学会名, 2025年9月, 大阪
-
-  [研究プロジェクト]
-  科研費基盤研究(C): 研究課題名, 2022-2024, 代表者: 中井聖
-
-  [報告書・その他]
-  中井聖: タイトル, 掲載誌・機関名, 2025年3月
+対応セクション:
+  * 著書             → books
+  * 学位論文          → skip
+  * 学術論文・作品など  → papers
+  * 国際会議、国内会議  → presentations
+  * 報告書，その他     → misc
+  * 外部資金の獲得     → projects
+  * 地域社会への貢献   → skip
+  * 委員・役員など     → skip
+  * 学会等の組織運営   → skip
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as dc_field
 from typing import Optional
 
+# ── 和暦→西暦 ─────────────────────────────────────────────────
+
+_WAREKI_BASE = {'令和': 2018, '平成': 1988, '昭和': 1925, '大正': 1911}
+_WAREKI_RE = re.compile(r'(令和|平成|昭和|大正)(\d+)')
+
+
+def _wareki(text: str) -> str:
+    return _WAREKI_RE.sub(lambda m: str(_WAREKI_BASE[m.group(1)] + int(m.group(2))), text)
+
+
+def _parse_ym(text: str) -> tuple[Optional[int], Optional[int]]:
+    t = _wareki(text)
+    m = re.search(r'(\d{4})年(\d{1,2})月', t)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r'(\d{4})年', t)
+    return (int(m.group(1)), None) if m else (None, None)
+
+
+def _parse_year_range(text: str) -> tuple[Optional[int], Optional[int]]:
+    """「令和8～11年度」→ (2026, 2029)"""
+    t = _wareki(text)
+    m = re.search(r'(\d{4})[～〜~](\d{4})', t)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = re.search(r'(\d{4})', t)
+    return (int(m.group(1)), int(m.group(1))) if m else (None, None)
+
+
+# ── ユーティリティ ────────────────────────────────────────────
+
+def _strip_num(line: str) -> str:
+    return re.sub(r'^\d+\.\s*', '', line)
+
+
+def _detect_lang(text: str) -> str:
+    return 'ja' if re.search(r'[ぁ-ん一-鿿]', text) else 'en'
+
+
+def _split_first_colon(line: str) -> tuple[str, str]:
+    """「著者: 残り」を分割。ただし '：' も対象。"""
+    for sep in (': ', '：'):
+        idx = line.find(sep)
+        if idx != -1:
+            return line[:idx], line[idx + len(sep):]
+    return '', line
+
+
+def _parse_authors(text: str) -> tuple[list[str], Optional[str]]:
+    """
+    著者文字列を解析して (著者リスト, 太字著者名) を返す。
+    太字（**name**）は筆頭/最終著者判定に使う。
+    """
+    parts = re.split(r'[，、,]\s*', text)
+    authors = []
+    bold = None
+    for p in parts:
+        p = p.strip()
+        bm = re.fullmatch(r'\*\*(.+?)\*\*', p)
+        if bm:
+            name = bm.group(1)
+            authors.append(name)
+            bold = name
+        else:
+            clean = re.sub(r'\*\*(.+?)\*\*', r'\1', p).strip()
+            if clean:
+                authors.append(clean)
+    return authors, bold
+
+
+def _split_csv(text: str) -> list[str]:
+    """全角・半角カンマで分割。"""
+    return [p.strip() for p in re.split(r'[，,]\s*', text) if p.strip()]
+
+
+def _split_half(text: str) -> list[str]:
+    """半角カンマ+スペースのみで分割（タイトル内の全角カンマを保持）。"""
+    return [p.strip() for p in text.split(', ') if p.strip()]
+
+
+# ── データクラス ─────────────────────────────────────────────
 
 @dataclass
 class Paper:
-    authors: list[str]
     title: str
-    journal: str
+    lang: str
+    authors: list[str]
+    bold_author: Optional[str] = None
+    journal: str = ''
     year: Optional[int] = None
     month: Optional[int] = None
     volume: Optional[str] = None
     number: Optional[str] = None
-    pages: Optional[str] = None
+    start_page: Optional[str] = None
+    end_page: Optional[str] = None
     doi: Optional[str] = None
-    language: str = "ja"
 
 
 @dataclass
-class Book:
-    authors: list[str]
+class BookEtc:
     title: str
-    publisher: str
+    lang: str
+    author_text: str       # 著者欄の生テキスト（複雑な表記のためそのまま保持）
+    publisher: str = ''
     year: Optional[int] = None
     month: Optional[int] = None
-    isbn: Optional[str] = None
-    language: str = "ja"
+    note: str = ''         # 「分担執筆」など括弧内の注記
 
 
 @dataclass
 class Presentation:
-    authors: list[str]
     title: str
-    event: str
+    lang: str
+    authors: list[str]
+    bold_author: Optional[str] = None
+    event: str = ''
     year: Optional[int] = None
     month: Optional[int] = None
-    location: Optional[str] = None
-    language: str = "ja"
+
+
+@dataclass
+class MiscItem:
+    title: str
+    lang: str
+    authors: list[str]
+    publication: str = ''
+    year: Optional[int] = None
+    month: Optional[int] = None
+    volume: Optional[str] = None
+    number: Optional[str] = None
+    start_page: Optional[str] = None
+    end_page: Optional[str] = None
 
 
 @dataclass
 class ResearchProject:
     title: str
-    funding_agency: Optional[str] = None
+    offer_org: str = ''
+    system_name: str = ''
     year_start: Optional[int] = None
     year_end: Optional[int] = None
-    pi: Optional[str] = None
-    project_number: Optional[str] = None
-
-
-@dataclass
-class OtherAchievement:
-    authors: list[str]
-    title: str
-    publisher: Optional[str] = None
-    year: Optional[int] = None
-    month: Optional[int] = None
-    language: str = "ja"
+    grant_number: Optional[str] = None
+    investigators: str = ''
 
 
 @dataclass
 class ParsedData:
-    papers: list[Paper] = field(default_factory=list)
-    books: list[Book] = field(default_factory=list)
-    presentations: list[Presentation] = field(default_factory=list)
-    projects: list[ResearchProject] = field(default_factory=list)
-    others: list[OtherAchievement] = field(default_factory=list)
+    papers: list[Paper] = dc_field(default_factory=list)
+    books: list[BookEtc] = dc_field(default_factory=list)
+    presentations: list[Presentation] = dc_field(default_factory=list)
+    misc: list[MiscItem] = dc_field(default_factory=list)
+    projects: list[ResearchProject] = dc_field(default_factory=list)
 
 
-# 年月のパターン (例: 2025年3月, 2025年, 2025/03)
-_YEAR_MONTH_RE = re.compile(r'(\d{4})年(?:(\d{1,2})月)?')
-_YEAR_ONLY_RE = re.compile(r'(\d{4})年')
-_YEAR_SLASH_RE = re.compile(r'(\d{4})/(\d{1,2})')
-_DOI_RE = re.compile(r'DOI:\s*([\w./\-]+)', re.IGNORECASE)
-_VOL_NUM_PAGES_RE = re.compile(r'(\d+)\((\d+)\):\s*([\d\-–]+)')
-_VOL_PAGES_RE = re.compile(r'(\d+),\s*([\d\-–]+)')
-_ISBN_RE = re.compile(r'ISBN[:\-]?\s*([\d\-X]+)', re.IGNORECASE)
+# ── セクション判定 ────────────────────────────────────────────
+
+_SECTIONS = [
+    (re.compile(r'著書'), 'books'),
+    (re.compile(r'学位論文'), 'skip'),
+    (re.compile(r'学術論文|作品'), 'papers'),
+    (re.compile(r'国際会議|国内会議|学会発表|講演'), 'presentations'),
+    (re.compile(r'報告書|その他'), 'misc'),
+    (re.compile(r'外部資金|特許|知財'), 'projects'),
+    (re.compile(r'地域社会|委員|役員|組織運営|財団法人|社団法人'), 'skip'),
+]
 
 
-def _detect_language(text: str) -> str:
-    # 日本語文字が含まれていれば ja
-    if re.search(r'[぀-ヿ一-鿿]', text):
-        return "ja"
-    return "en"
-
-
-def _parse_year_month(text: str) -> tuple[Optional[int], Optional[int]]:
-    m = _YEAR_MONTH_RE.search(text)
-    if m:
-        year = int(m.group(1))
-        month = int(m.group(2)) if m.group(2) else None
-        return year, month
-    m = _YEAR_SLASH_RE.search(text)
-    if m:
-        return int(m.group(1)), int(m.group(2))
-    m = _YEAR_ONLY_RE.search(text)
-    if m:
-        return int(m.group(1)), None
-    return None, None
-
-
-def _split_authors(authors_str: str) -> list[str]:
-    # 読点（，、,）やセミコロンで著者を分割
-    parts = re.split(r'[，、,;；]\s*', authors_str.strip())
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _parse_paper_line(line: str) -> Optional[Paper]:
-    """
-    例: 著者1, 著者2: タイトル, 雑誌名, 26(5): 927-934, 2025年3月, DOI:xxx
-    """
-    if ':' not in line:
-        return None
-    # 著者部分とそれ以降に分割（最初の ':' で分割）
-    author_part, rest = line.split(':', 1)
-    authors = _split_authors(author_part)
-
-    # 残りをカンマで分割
-    parts = [p.strip() for p in rest.split(',')]
-    if not parts:
-        return None
-
-    title = parts[0].strip()
-    journal = parts[1].strip() if len(parts) > 1 else ""
-
-    doi = None
-    doi_m = _DOI_RE.search(line)
-    if doi_m:
-        doi = doi_m.group(1)
-
-    year, month = _parse_year_month(line)
-    volume = number = pages = None
-
-    # 巻号ページのパース
-    vol_num_m = _VOL_NUM_PAGES_RE.search(line)
-    if vol_num_m:
-        volume = vol_num_m.group(1)
-        number = vol_num_m.group(2)
-        pages = vol_num_m.group(3)
-    else:
-        # 巻, ページ形式 (例: 50, 8-15)
-        for p in parts[2:]:
-            p = p.strip()
-            if re.match(r'^\d+$', p):
-                if volume is None:
-                    volume = p
-            elif re.match(r'^\d+[\-–]\d+$', p):
-                pages = p
-
-    lang = _detect_language(title + author_part)
-
-    return Paper(
-        authors=authors,
-        title=title,
-        journal=journal,
-        year=year,
-        month=month,
-        volume=volume,
-        number=number,
-        pages=pages,
-        doi=doi,
-        language=lang,
-    )
-
-
-def _parse_book_line(line: str) -> Optional[Book]:
-    """
-    例: 著者1, 著者2: 書名, 出版社, 2024年4月, ISBN:xxx
-    """
-    if ':' not in line:
-        return None
-    author_part, rest = line.split(':', 1)
-    authors = _split_authors(author_part)
-    parts = [p.strip() for p in rest.split(',')]
-    if not parts:
-        return None
-    title = parts[0].strip()
-    publisher = parts[1].strip() if len(parts) > 1 else ""
-    year, month = _parse_year_month(line)
-    isbn = None
-    isbn_m = _ISBN_RE.search(line)
-    if isbn_m:
-        isbn = isbn_m.group(1)
-    lang = _detect_language(title + author_part)
-    return Book(authors=authors, title=title, publisher=publisher,
-                year=year, month=month, isbn=isbn, language=lang)
-
-
-def _parse_presentation_line(line: str) -> Optional[Presentation]:
-    """
-    例: 著者1, 著者2: 発表タイトル, 学会名, 2025年9月, 東京
-    """
-    if ':' not in line:
-        return None
-    author_part, rest = line.split(':', 1)
-    authors = _split_authors(author_part)
-    parts = [p.strip() for p in rest.split(',')]
-    if not parts:
-        return None
-    title = parts[0].strip()
-    event = parts[1].strip() if len(parts) > 1 else ""
-    year, month = _parse_year_month(line)
-    # 最後の部分で年月に該当しないものを場所とみなす
-    location = None
-    for p in reversed(parts[2:]):
-        p = p.strip()
-        if not _YEAR_MONTH_RE.search(p) and not _YEAR_ONLY_RE.search(p):
-            location = p
-            break
-    lang = _detect_language(title + author_part)
-    return Presentation(authors=authors, title=title, event=event,
-                        year=year, month=month, location=location, language=lang)
-
-
-def _parse_project_line(line: str) -> Optional[ResearchProject]:
-    """
-    例: 科研費基盤研究(C): 研究課題名, 2022-2024, 代表者: 中井聖
-    例: 研究課題名, 機関名, 2023-2025, 課題番号: 12345
-    """
-    year_start = year_end = None
-    year_range_m = re.search(r'(\d{4})\s*[-–]\s*(\d{4})', line)
-    if year_range_m:
-        year_start = int(year_range_m.group(1))
-        year_end = int(year_range_m.group(2))
-
-    pi = None
-    pi_m = re.search(r'代表者[:：]\s*(.+?)(?:,|$)', line)
-    if pi_m:
-        pi = pi_m.group(1).strip()
-
-    proj_num = None
-    num_m = re.search(r'課題番号[:：]\s*([\w\d]+)', line)
-    if num_m:
-        proj_num = num_m.group(1)
-
-    funding = None
-    title = line
-    if ':' in line or '：' in line:
-        sep_idx = min(
-            (line.index(':') if ':' in line else len(line)),
-            (line.index('：') if '：' in line else len(line))
-        )
-        funding = line[:sep_idx].strip()
-        rest = line[sep_idx + 1:].strip()
-        parts = [p.strip() for p in rest.split(',')]
-        title = parts[0] if parts else rest
-    else:
-        parts = [p.strip() for p in line.split(',')]
-        title = parts[0]
-
-    return ResearchProject(
-        title=title.strip(),
-        funding_agency=funding,
-        year_start=year_start,
-        year_end=year_end,
-        pi=pi,
-        project_number=proj_num,
-    )
-
-
-def _parse_other_line(line: str) -> Optional[OtherAchievement]:
-    """
-    例: 著者1, 著者2: タイトル, 掲載誌・機関名, 2025年3月
-    """
-    if ':' not in line:
-        return None
-    author_part, rest = line.split(':', 1)
-    authors = _split_authors(author_part)
-    parts = [p.strip() for p in rest.split(',')]
-    if not parts:
-        return None
-    title = parts[0].strip()
-    publisher = parts[1].strip() if len(parts) > 1 else None
-    year, month = _parse_year_month(line)
-    lang = _detect_language(title + author_part)
-    return OtherAchievement(authors=authors, title=title, publisher=publisher,
-                            year=year, month=month, language=lang)
-
-
-# カテゴリを示すヘッダー行のパターン
-_CATEGORY_HEADERS = {
-    re.compile(r'論文|paper|article', re.IGNORECASE): 'paper',
-    re.compile(r'著書|book|編著', re.IGNORECASE): 'book',
-    re.compile(r'講演|口頭発表|presentation|conference', re.IGNORECASE): 'presentation',
-    re.compile(r'研究プロジェクト|project|科研費|競争的資金|grants', re.IGNORECASE): 'project',
-    re.compile(r'報告書|その他|other|misc', re.IGNORECASE): 'other',
-}
-
-
-def _detect_category(line: str) -> Optional[str]:
-    stripped = line.strip()
-    # ヘッダー行は括弧で囲まれているか、短い（30文字以下）かつデータ行でない行
-    is_header = (
-        re.match(r'^[\[【〔#]', stripped)  # [ 【 〔 # で始まる
-        or (len(stripped) <= 30 and ':' not in stripped and '，' not in stripped)
-    )
-    if not is_header:
-        return None
-    stripped = stripped.strip('[]【】〔〕#')
-    for pattern, cat in _CATEGORY_HEADERS.items():
-        if pattern.search(stripped):
+def _detect_section(line: str) -> Optional[str]:
+    stripped = re.sub(r'^[*＊#\s]+', '', line).strip()
+    for pat, cat in _SECTIONS:
+        if pat.search(stripped):
             return cat
     return None
 
 
+# ── 行パーサー ──────────────────────────────────────────────
+
+def _parse_paper(line: str) -> Optional[Paper]:
+    author_str, rest = _split_first_colon(line)
+    if not rest:
+        return None
+    authors, bold = _parse_authors(author_str)
+    parts = _split_half(rest)
+    if not parts:
+        return None
+    title = parts[0]
+    journal = parts[1] if len(parts) > 1 else ''
+
+    doi = None
+    doi_m = re.search(r'DOI:\s*([\w./\-]+)', rest, re.IGNORECASE)
+    if doi_m:
+        doi = doi_m.group(1)
+
+    year, month = _parse_ym(rest)
+    volume = number = start_page = end_page = None
+
+    # 26(5): 927-934 形式
+    rest_csv = _split_csv(rest)
+    vm = re.search(r'(\d+)\(([^)]+)\)[：:]\s*(\d+)[-–](\d+)', rest)
+    if vm:
+        volume, number = vm.group(1), vm.group(2)
+        start_page, end_page = vm.group(3), vm.group(4)
+    else:
+        for p in rest_csv[2:]:
+            if re.match(r'^\d+$', p) and volume is None and not re.search(r'年|月', p):
+                volume = p
+            elif re.match(r'^(\d+)[-–](\d+)$', p) and start_page is None:
+                pm = re.match(r'^(\d+)[-–](\d+)$', p)
+                start_page, end_page = pm.group(1), pm.group(2)
+
+    return Paper(
+        title=title, lang=_detect_lang(title),
+        authors=authors, bold_author=bold,
+        journal=journal, year=year, month=month,
+        volume=volume, number=number,
+        start_page=start_page, end_page=end_page, doi=doi,
+    )
+
+
+def _parse_book(line: str) -> Optional[BookEtc]:
+    author_str, rest = _split_first_colon(line)
+    if not rest:
+        return None
+    parts = _split_csv(rest)
+    title = parts[0] if parts else rest
+    publisher = parts[1] if len(parts) > 1 else ''
+    year, month = _parse_ym(rest)
+    note_m = re.search(r'[（(]([^）)]+)[）)]', rest)
+    note = note_m.group(1) if note_m else ''
+    return BookEtc(
+        title=title, lang=_detect_lang(title),
+        author_text=re.sub(r'\*\*(.+?)\*\*', r'\1', author_str).strip(),
+        publisher=publisher, year=year, month=month, note=note,
+    )
+
+
+def _parse_presentation(line: str) -> Optional[Presentation]:
+    author_str, rest = _split_first_colon(line)
+    if not rest:
+        return None
+    authors, bold = _parse_authors(author_str)
+    parts = _split_csv(rest)
+    title = parts[0] if parts else rest
+    event = parts[1] if len(parts) > 1 else ''
+    year, month = _parse_ym(rest)
+    return Presentation(
+        title=title, lang=_detect_lang(title),
+        authors=authors, bold_author=bold,
+        event=event, year=year, month=month,
+    )
+
+
+def _parse_misc(line: str) -> Optional[MiscItem]:
+    author_str, rest = _split_first_colon(line)
+    if not rest:
+        return None
+    authors, _ = _parse_authors(author_str)
+    parts = _split_half(rest)
+    rest_csv = _split_csv(rest)
+    title = parts[0] if parts else rest
+    publication = parts[1] if len(parts) > 1 else ''
+    year, month = _parse_ym(rest)
+    volume = number = start_page = end_page = None
+
+    vm = re.search(r'(\d+)\((\d+)\)[,，：:]\s*(\d+)[-–](\d+)', rest)
+    if vm:
+        volume, number = vm.group(1), vm.group(2)
+        start_page, end_page = vm.group(3), vm.group(4)
+    else:
+        for p in rest_csv[2:]:
+            if re.match(r'^\d+$', p) and volume is None and not re.search(r'年|月', p):
+                volume = p
+            elif re.match(r'^(\d+)[-–](\d+)$', p) and start_page is None:
+                pm = re.match(r'^(\d+)[-–](\d+)$', p)
+                start_page, end_page = pm.group(1), pm.group(2)
+
+    return MiscItem(
+        title=title, lang=_detect_lang(title),
+        authors=authors, publication=publication,
+        year=year, month=month,
+        volume=volume, number=number,
+        start_page=start_page, end_page=end_page,
+    )
+
+
+_KAKENHI_TYPE_RE = re.compile(
+    r'基盤研究\([A-Z]\)|挑戦的萌芽研究|挑戦的研究\([^)]+\)|若手研究|研究活動スタート支援|特別研究員奨励費|萌芽研究'
+)
+
+
+def _parse_project(line: str) -> Optional[ResearchProject]:
+    grant_m = re.search(r'課題番号[：:]\s*([\w\d]+)', line)
+    grant_no = grant_m.group(1) if grant_m else None
+
+    parts = re.split(r'[，,]\s*', line)
+    funding_raw = parts[0].strip() if parts else ''
+
+    year_start = year_end = None
+    title_parts: list[str] = []
+    inv_parts: list[str] = []
+
+    found_inv = False
+    for raw in parts[1:]:
+        raw = raw.strip()
+
+        # 同一元号の年度範囲（例: 令和8～11年度）を先に処理
+        era_range_m = re.search(r'(令和|平成|昭和|大正)(\d+)[～〜~](\d+)年度?', raw)
+        if era_range_m:
+            base = _WAREKI_BASE[era_range_m.group(1)]
+            year_start = base + int(era_range_m.group(2))
+            year_end = base + int(era_range_m.group(3))
+            continue
+
+        conv = _wareki(raw)
+
+        # 年度範囲
+        yrm = re.search(r'(\d{4})[～〜~](\d{4})年度', conv)
+        if yrm:
+            year_start, year_end = int(yrm.group(1)), int(yrm.group(2))
+            continue
+        # 単年度（短い文字列）
+        yrm2 = re.search(r'^(\d{4})年度$', conv)
+        if yrm2:
+            if not year_start:
+                year_start = year_end = int(yrm2.group(1))
+            continue
+        # 課題番号
+        if re.search(r'課題番号[：:]', raw):
+            continue
+        # 研究者（（代表者）・（分担者）・太字）
+        if re.search(r'（代表者）|（分担者）|\*\*', raw):
+            inv_parts.append(re.sub(r'\*\*(.+?)\*\*', r'\1', raw))
+            found_inv = True
+            continue
+        # 最初の研究者が見つかった後は残りも研究者とみなす
+        if found_inv:
+            inv_parts.append(raw)
+            continue
+        # タイトル候補（それ以外の意味のある文字列）
+        if len(raw) >= 5:
+            title_parts.append(raw)
+
+    if not title_parts:
+        return None
+    title = '，'.join(title_parts)
+
+    # funding_raw から年度プレフィックスを除去して機関名・事業名を分離
+    funding_conv = _wareki(funding_raw)
+    funding_clean = re.sub(r'^\d{4}年度\s*', '', funding_conv).strip()
+
+    kakenhi_m = _KAKENHI_TYPE_RE.search(funding_raw)
+    if kakenhi_m or '科学研究費' in funding_raw:
+        offer_org = '日本学術振興会'
+        system_name = '科学研究費助成事業'
+        if kakenhi_m:
+            system_name += ' ' + kakenhi_m.group(0)
+    else:
+        # スペースで機関名と事業名を分離
+        sp = funding_clean.find(' ')
+        if sp != -1:
+            offer_org = funding_clean[:sp]
+            system_name = funding_clean[sp:].strip()
+        else:
+            offer_org = funding_clean
+            system_name = ''
+
+    # 年度が未取得の場合は funding_raw から探す
+    if not year_start:
+        year_start, year_end = _parse_year_range(funding_raw)
+
+    return ResearchProject(
+        title=title,
+        offer_org=offer_org,
+        system_name=system_name,
+        year_start=year_start,
+        year_end=year_end,
+        grant_number=grant_no,
+        investigators='，'.join(inv_parts),
+    )
+
+
+# ── メインパース関数 ─────────────────────────────────────────
+
 def parse_text(text: str) -> ParsedData:
-    """テキストをパースして ParsedData を返す。"""
     result = ParsedData()
-    current_category = 'paper'  # デフォルトは論文
+    current = 'skip'
 
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith('#'):
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
             continue
 
-        # カテゴリヘッダーの検出
-        cat = _detect_category(line)
-        if cat:
-            current_category = cat
+        # セクションヘッダー
+        if raw.lstrip().startswith('*'):
+            sec = _detect_section(line)
+            if sec is not None:
+                current = sec
             continue
 
+        if current == 'skip':
+            continue
+        if not re.match(r'^\d+\.', line):
+            continue
+
+        line = _strip_num(line)
         try:
-            if current_category == 'paper':
-                obj = _parse_paper_line(line)
+            if current == 'papers':
+                obj = _parse_paper(line)
                 if obj:
                     result.papers.append(obj)
-            elif current_category == 'book':
-                obj = _parse_book_line(line)
+            elif current == 'books':
+                obj = _parse_book(line)
                 if obj:
                     result.books.append(obj)
-            elif current_category == 'presentation':
-                obj = _parse_presentation_line(line)
+            elif current == 'presentations':
+                obj = _parse_presentation(line)
                 if obj:
                     result.presentations.append(obj)
-            elif current_category == 'project':
-                obj = _parse_project_line(line)
+            elif current == 'misc':
+                obj = _parse_misc(line)
+                if obj:
+                    result.misc.append(obj)
+            elif current == 'projects':
+                obj = _parse_project(line)
                 if obj:
                     result.projects.append(obj)
-            elif current_category == 'other':
-                obj = _parse_other_line(line)
-                if obj:
-                    result.others.append(obj)
         except Exception as e:
-            print(f"[WARN] パース失敗: {line!r} -> {e}")
+            print(f'[WARN] パース失敗: {line[:70]!r} -> {e}')
 
     return result
