@@ -1,0 +1,23 @@
+{
+  "published_papers": [
+    {
+      "id": "1234567",
+      "paper_title": [{"@value": "Development and validation of a scale for assessing enjoyment of rogaining activities", "@language": "en"}],
+      "authors": {"@list": [
+        {"name": [{"@value": "Akira Nakai", "@language": "en"}]},
+        {"name": [{"@value": "Maki Tanaka", "@language": "en"}]}
+      ]},
+      "publication_name": [{"@value": "Journal of Physical Education and Sport", "@language": "en"}],
+      "published_date": "2026-05",
+      "volume": "26",
+      "number": "5",
+      "starting_page": "927",
+      "ending_page": "934",
+      "doi": "10.7752/jpes.2026.05093"
+    }
+  ],
+  "books": [],
+  "presentations": [],
+  "research_projects": [],
+  "misc": []
+}

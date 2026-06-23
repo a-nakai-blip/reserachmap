@@ -1,30 +1,31 @@
-# researchmap 同期ツール
+# researchmap インポートファイル生成ツール
 
-大学研究業績サイトのテキストデータを researchmap に同期するツールです。
+大学研究業績サイトのテキストデータを読み込み、researchmap にインポート可能な JSON ファイルを生成します。researchmap に既に登録されているデータとの重複を自動的に除外します。
 
-## セットアップ
+## 使い方
+
+### 1. セットアップ
 
 ```bash
 pip install -r requirements.txt
-cp config.yaml.example config.yaml
 ```
 
-`config.yaml` を編集して researchmap の認証情報を設定します。
-
-### researchmap API キーの取得
+### 2. researchmap からエクスポート
 
 1. [researchmap](https://researchmap.jp) にログイン
-2. 右上のユーザー名 → 「外部サービス連携」→「API」を開く
-3. 「クライアント登録」でアプリ名を入力し、**クライアントID** と **クライアントシークレット** を取得
-4. **研究者ID** は researchmap の自分のページURL (`https://researchmap.jp/【この部分】`) を確認
+2. 業績管理 → 各カテゴリ（論文・著書・講演など）→「エクスポート」→ JSON を選択
+3. ダウンロードしたファイルを `researchmap_export.json` という名前で保存
 
-## 入力データ形式
+複数カテゴリのエクスポートファイルを結合するか、カテゴリを個別に処理することもできます。
 
-`input_example.txt` を参考に、以下のカテゴリで業績を記述します。
+### 3. 業績テキストファイルを作成
+
+`input_example.txt` を参考に、大学研究業績サイトからコピーしたテキストを用意します。
 
 ```
 [論文]
 著者1, 著者2: タイトル, 雑誌名, 巻(号): ページ, 年月, DOI:xxx
+中井聖, 田中真紀: ラダーゲッターの投げ方..., 自由時間研究, 50, 8-15, 2025年3月
 
 [著書・編著]
 著者1: 書名, 出版社, 年月, ISBN:xxx
@@ -41,31 +42,50 @@ cp config.yaml.example config.yaml
 
 カテゴリヘッダーは `[論文]`、`【著書】`、`# 講演` など柔軟に書けます。
 
-## 実行
+### 4. インポートファイルを生成
 
 ```bash
-# ドライラン（確認のみ、researchmap への書き込みなし）
-python sync.py --input input.txt --dry-run
+# 基本的な使い方
+python generate_import.py --input 業績.txt --export researchmap_export.json
 
-# 実際に同期
-python sync.py --input input.txt
+# 詳細表示（各件の処理状況を確認）
+python generate_import.py --input 業績.txt --export researchmap_export.json --verbose
 
-# 特定カテゴリのみ同期
-python sync.py --input input.txt --category paper
+# 出力ファイル名を指定
+python generate_import.py --input 業績.txt --export researchmap_export.json --output 2025_import.json
+
+# 件数確認のみ（ファイルを出力しない）
+python generate_import.py --input 業績.txt --export researchmap_export.json --dry-run
+
+# 特定カテゴリのみ処理
+python generate_import.py --input 業績.txt --export researchmap_export.json --category paper
+
+# エクスポートなし（全件を出力）
+python generate_import.py --input 業績.txt
 ```
 
-## 同期の仕組み
+### 5. researchmap にインポート
 
-- DOI（論文）または ISBN（著書）が一致する場合は **更新**
-- 一致するものがない場合は **新規追加**
-- `config.yaml` の `match_key` で照合キーを変更可能
+1. researchmap にログイン
+2. 業績管理 → 各カテゴリ → 「インポート」
+3. 生成された `import.json` を選択してインポート
+
+## 重複判定のロジック
+
+| カテゴリ | 優先キー | 代替キー |
+|---|---|---|
+| 論文 | DOI | タイトル（DOIなしの場合） |
+| 著書 | ISBN | タイトル（ISBNなしの場合） |
+| 講演 | タイトル | - |
+| 研究プロジェクト | タイトル | - |
+| その他 | タイトル | - |
 
 ## ファイル構成
 
 | ファイル | 説明 |
 |---|---|
-| `sync.py` | メインスクリプト |
+| `generate_import.py` | メインスクリプト |
 | `parser.py` | 大学業績テキストのパーサー |
-| `researchmap_api.py` | researchmap API クライアント |
-| `config.yaml` | 設定ファイル（要作成） |
+| `converter.py` | researchmap JSON 形式への変換 |
 | `input_example.txt` | 入力テキストのサンプル |
+| `researchmap_export_example.json` | エクスポート JSON のサンプル |
